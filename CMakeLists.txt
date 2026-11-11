@@ -613,6 +613,12 @@ if(BF2_BUILD_LINUX)
         "${BF2_EXTERNAL_ROOT}/python-embedded/linux"
         "${BF2_EXTERNAL_ROOT}/python-embedded/py-src-2.3.4/Include"
     )
+    if(BF2_BUILD_ANDROID)
+        # The bionic pyconfig.h overlay must come first (it #include_next's linux/pyconfig.h),
+        # matching what the dice_py target exports.
+        list(INSERT BF2_PYTHON_INCLUDE_DIRS 0
+            "${BF2_EXTERNAL_ROOT}/python-embedded/linux/android")
+    endif()
 else()
     set(BF2_PYTHON_INCLUDE_DIRS
         "${BF2_EXTERNAL_ROOT}/python-embedded/py-src-2.3.4/Include"
