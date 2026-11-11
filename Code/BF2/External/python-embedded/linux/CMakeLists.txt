@@ -1,5 +1,8 @@
 # =================================================================================================
 # libdice_py.so - the embedded CPython 2.3.4 built as the Linux dedicated server's interpreter.
+# ANDROID (arm64-v8a, NDK Clang): also supported. pyconfig.h is the Linux x86-64 one with a thin
+# overlay (android/pyconfig.h, found first, #include_next's the real one) for the few bionic
+# differences. Use ANDROID_PLATFORM >= android-26 (getpwent/nl_langinfo/... need it).
 #
 # SCAFFOLDING - NOT RECOVERED SOURCE. This build description is [CHOSEN, not recovered]; what it
 # builds is vendored CPython 2.3.4 (../py-src-2.3.4, with local changes documented in README.md) with
@@ -28,13 +31,25 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(dice_py LANGUAGES C CXX)
 endif()
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+set(DICE_PY_ANDROID OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(DICE_PY_ANDROID ON)
+endif()
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT DICE_PY_ANDROID)
     message(FATAL_ERROR
-        "dice_py/linux: this directory builds libdice_py.so for Linux only (this is "
+        "dice_py/linux: this directory builds libdice_py.so for Linux and Android only (this is "
         "${CMAKE_SYSTEM_NAME}). The Windows dice_py.dll is built by "
         "Code/Build/python/build_python.cmd.")
 endif()
-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+if(DICE_PY_ANDROID)
+    # arm64-v8a is LP64 and little-endian like x86-64, so configure's pyconfig.h applies with the
+    # overlay in android/ (fpos_t is 8 bytes on bionic, no libutil/pty.h/stropts.h).
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
+        message(FATAL_ERROR
+            "dice_py/linux (Android): only arm64-v8a is supported; this is "
+            "${CMAKE_SYSTEM_PROCESSOR} with ${CMAKE_SIZEOF_VOID_P}-byte pointers.")
+    endif()
+elseif(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     message(FATAL_ERROR
         "dice_py/linux: pyconfig.h here is configure's output for Linux x86-64 (LP64, little-endian, "
         "16-byte fpos_t); this is ${CMAKE_SYSTEM_PROCESSOR} with ${CMAKE_SIZEOF_VOID_P}-byte "
@@ -43,7 +58,11 @@ endif()
 
 # Where libdice_py.so and dice_py_check land. The root project points this at the `bf2` directory.
 if(NOT DEFINED BF2_DICE_PY_OUTPUT_DIR)
-    set(BF2_DICE_PY_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_linux")
+    if(DICE_PY_ANDROID)
+        set(BF2_DICE_PY_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_android")
+    else()
+        set(BF2_DICE_PY_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_linux")
+    endif()
 endif()
 
 # -------------------------------------------------------------------------------------------------
@@ -170,6 +189,13 @@ target_include_directories(dice_py
     # Not needed, unlike the Windows build: PC/import_nt.c was the only unit that included
     # Python/importdl.h from outside Python/, and dynload_shlib.c lives in Python/ itself.
 )
+if(DICE_PY_ANDROID)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/android/pyconfig.h")
+        message(FATAL_ERROR "dice_py/linux (Android): android/pyconfig.h overlay is missing.")
+    endif()
+    # BEFORE: the overlay must be found ahead of ./pyconfig.h; it #include_next's the real one.
+    target_include_directories(dice_py BEFORE PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/android")
+endif()
 target_compile_definitions(dice_py PRIVATE
     Py_BUILD_CORE       # what Makefile.pre.in's PY_CFLAGS passes; exposes the core-only headers
     NDEBUG              # build_python.cmd is /O2 /DNDEBUG in every configuration; so is this
@@ -193,6 +219,7 @@ include(CheckCCompilerFlag)
 foreach(flag IN ITEMS
         -Wno-implicit-function-declaration
         -Wno-incompatible-pointer-types
+        -Wno-incompatible-function-pointer-types
         -Wno-int-conversion
         -Wno-implicit-int
         -Wno-return-mismatch)
@@ -211,8 +238,13 @@ endforeach()
 # build never is. PYTHONPATH/PLATFORM say linux2 where this kernel's configure says linux6:
 # [CHOSEN, not recovered] sys.platform is the retail-era value, the only one 2004 scripts could
 # have tested; see README.md.
+if(DICE_PY_ANDROID)
+    set(DICE_PY_PREFIX "/data/local/tmp")   # no /usr/local on Android; only a never-faulting default
+else()
+    set(DICE_PY_PREFIX "/usr/local")
+endif()
 set_source_files_properties("${DICE_PY_SRC}/Modules/getpath.c" PROPERTIES COMPILE_DEFINITIONS
-    "PREFIX=\"/usr/local\";EXEC_PREFIX=\"/usr/local\";VERSION=\"2.3\";VPATH=\"\";PYTHONPATH=\":plat-linux2:lib-tk\"")
+    "PREFIX=\"${DICE_PY_PREFIX}\";EXEC_PREFIX=\"${DICE_PY_PREFIX}\";VERSION=\"2.3\";VPATH=\"\";PYTHONPATH=\":plat-linux2:lib-tk\"")
 set_source_files_properties("${DICE_PY_SRC}/Python/getplatform.c" PROPERTIES COMPILE_DEFINITIONS
     "PLATFORM=\"linux2\"")
 
@@ -221,11 +253,14 @@ set_source_files_properties("${DICE_PY_SRC}/Python/getplatform.c" PROPERTIES COM
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 include(CheckFunctionExists)
-check_function_exists(openpty DICE_PY_OPENPTY_IN_LIBC)
 target_link_libraries(dice_py PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
-if(NOT DICE_PY_OPENPTY_IN_LIBC)
-    find_library(DICE_PY_UTIL_LIBRARY NAMES util REQUIRED)
-    target_link_libraries(dice_py PRIVATE "${DICE_PY_UTIL_LIBRARY}")
+if(NOT DICE_PY_ANDROID)
+    # Bionic has no libutil (the overlay also drops HAVE_OPENPTY/HAVE_FORKPTY), so Android skips this.
+    check_function_exists(openpty DICE_PY_OPENPTY_IN_LIBC)
+    if(NOT DICE_PY_OPENPTY_IN_LIBC)
+        find_library(DICE_PY_UTIL_LIBRARY NAMES util REQUIRED)
+        target_link_libraries(dice_py PRIVATE "${DICE_PY_UTIL_LIBRARY}")
+    endif()
 endif()
 # A shared object links even with unresolved symbols; refuse that, so a missing system library or
 # a module compiled without its dependency fails HERE rather than when `bf2` first dlopens it.
@@ -235,7 +270,12 @@ target_link_options(dice_py PRIVATE -Wl,--no-undefined)
 # The runtime check: the same pycheck.cpp the Windows build runs, linked against libdice_py.so and
 # finding it beside itself through $ORIGIN, exactly as `bf2` will.
 # -------------------------------------------------------------------------------------------------
-add_executable(dice_py_check "${DICE_PY_CHECK_SOURCE}")
+# On Android the check only runs on a device/emulator, so it is not part of the default build.
+if(DICE_PY_ANDROID)
+    add_executable(dice_py_check EXCLUDE_FROM_ALL "${DICE_PY_CHECK_SOURCE}")
+else()
+    add_executable(dice_py_check "${DICE_PY_CHECK_SOURCE}")
+endif()
 target_link_libraries(dice_py_check PRIVATE dice_py)
 target_compile_definitions(dice_py_check PRIVATE DEDICATED=1)
 target_compile_options(dice_py_check PRIVATE "-include${DICE_PY_BUILDCONFIG_H}")
