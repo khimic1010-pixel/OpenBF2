@@ -16,20 +16,28 @@ project(BF2Rebuilt LANGUAGES C CXX)
 #   * GCC/Clang, Linux    - the native Linux dedicated port: `bf2` + `libdice_py.so`. It is the x64
 #     x86-64                port's pointer-bearing layouts compiled by the platform family the ELF
 #                           oracle was built for.
+#   * Clang, Android NDK  - arm64-v8a build of the Linux port (BF2_BUILD_ANDROID, 2026-11-11). Android
+#     arm64-v8a            is a Linux-kernel target, so it reuses every BF2_BUILD_LINUX branch and adds
+#                          only the Android-specific deltas (no ncurses, libc++ instead of libstdc++).
 # Everything Linux-specific in this file sits under BF2_BUILD_LINUX; the MSVC configurations are
 # untouched by it. The Linux build is a native port (`[CHOSEN, not recovered]` layouts, like x64),
 # not a reproduction of the shipped 32-bit ELF's object layouts.
 # =================================================================================================
 set(BF2_BUILD_LINUX OFF)
+set(BF2_BUILD_ANDROID OFF)
 if(MSVC)
     # The two Windows configurations, selected by pointer width below.
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Android NDK toolchain file: CMAKE_SYSTEM_NAME is "Android" (not "Linux"), compiler is Clang.
+    set(BF2_BUILD_ANDROID ON)
+    set(BF2_BUILD_LINUX ON)   # reuse every Linux-port branch below
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(BF2_BUILD_LINUX ON)
 else()
     message(FATAL_ERROR
-        "BF2Rebuilt builds with MSVC on Windows (msvc-x86 / msvc-x64 presets) or with GCC/Clang on "
-        "Linux x86-64 (linux-x64 preset). This toolchain is ${CMAKE_CXX_COMPILER_ID} on "
-        "${CMAKE_SYSTEM_NAME}.")
+        "BF2Rebuilt builds with MSVC on Windows (msvc-x86 / msvc-x64 presets), with GCC/Clang on "
+        "Linux x86-64 (linux-x64 preset), or with the Android NDK Clang (arm64-v8a). This toolchain "
+        "is ${CMAKE_CXX_COMPILER_ID} on ${CMAKE_SYSTEM_NAME}.")
 endif()
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT BF2_BUILD_LINUX)
@@ -40,7 +48,16 @@ elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     # configuration is a native portability target and must acquire its own pointer-bearing
     # layouts while preserving the shipped wire/file widths.
     set(BF2_BUILD_X64 ON)
-    if(BF2_BUILD_LINUX)
+    if(BF2_BUILD_ANDROID)
+        if(DEFINED ANDROID_ABI AND NOT ANDROID_ABI STREQUAL "arm64-v8a")
+            message(FATAL_ERROR
+                "The Android port supports only arm64-v8a (ANDROID_ABI=${ANDROID_ABI}).")
+        endif()
+        set(BF2_NATIVE_ARCH "android-arm64")
+        message(STATUS
+            "Configuring the Android arm64-v8a port (Clang, NDK; bf2 + libdice_py.so). "
+            "See docs/building.md for toolchain and runtime setup.")
+    elseif(BF2_BUILD_LINUX)
         set(BF2_NATIVE_ARCH "linux-x64")
         message(STATUS
             "Configuring the native Linux x86-64 dedicated-server port (bf2 + libdice_py.so). "
@@ -53,8 +70,8 @@ elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     endif()
 else()
     message(FATAL_ERROR
-        "BF2Rebuilt supports only MSVC x86 (retail-fidelity), MSVC x64 (native dedicated port) "
-        "and Linux x86-64 (native dedicated port) configurations; "
+        "BF2Rebuilt supports only MSVC x86 (retail-fidelity), MSVC x64 (native dedicated port), "
+        "Linux x86-64 and Android arm64-v8a (native dedicated ports) configurations; "
         "CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P}.")
 endif()
 
@@ -555,6 +572,10 @@ function(bf2_configure_c_target target)
         if(BF2_BUILD_LINUX)
             target_compile_definitions("${target}" PRIVATE _LINUX _GNU_SOURCE)
         endif()
+        if(BF2_BUILD_ANDROID)
+            # Clang 16+ (NDK r26) made this an error by default; same policy as GCC 14 above.
+            target_compile_options("${target}" PRIVATE -Wno-incompatible-function-pointer-types)
+        endif()
     endif()
     bf2_add_compile_debug_info("${target}")
     bf2_use_static_msvc_runtime("${target}")
@@ -608,9 +629,29 @@ if(BF2_BUILD_LINUX)
     # the narrow libncurses.so.6 is a separate package on Debian-family systems and its dev symlink
     # is a linker script that fails when only the wide runtime exists. The status screen calls the
     # same functions in both.
-    set(CURSES_NEED_NCURSES TRUE)
-    set(CURSES_NEED_WIDE TRUE)
-    find_package(Curses REQUIRED)
+    if(BF2_BUILD_ANDROID)
+        # The NDK ships no ncurses. Either supply a prebuilt one for arm64-v8a
+        #   -DBF2_ANDROID_CURSES_INCLUDE_DIR=<dir> -DBF2_ANDROID_CURSES_LIBRARY=<libncurses.a|.so>
+        # or build without the status screen (BF2_NO_CURSES=1 is defined; the status-monitor
+        # sources must honour it - see Game/Main/StatusMonitorImpl/posix.cpp).
+        set(BF2_ANDROID_CURSES_INCLUDE_DIR "" CACHE PATH "Android arm64 ncurses include directory")
+        set(BF2_ANDROID_CURSES_LIBRARY "" CACHE FILEPATH "Android arm64 ncurses library")
+        if(BF2_ANDROID_CURSES_LIBRARY AND BF2_ANDROID_CURSES_INCLUDE_DIR)
+            set(CURSES_INCLUDE_DIRS "${BF2_ANDROID_CURSES_INCLUDE_DIR}")
+            set(CURSES_LIBRARIES "${BF2_ANDROID_CURSES_LIBRARY}")
+        else()
+            set(CURSES_INCLUDE_DIRS "")
+            set(CURSES_LIBRARIES "")
+            message(WARNING
+                "Android: no ncurses supplied, building without the curses status screen "
+                "(defining BF2_NO_CURSES=1). Pass BF2_ANDROID_CURSES_INCLUDE_DIR and "
+                "BF2_ANDROID_CURSES_LIBRARY to link a prebuilt arm64 ncurses instead.")
+        endif()
+    else()
+        set(CURSES_NEED_NCURSES TRUE)
+        set(CURSES_NEED_WIDE TRUE)
+        find_package(Curses REQUIRED)
+    endif()
 endif()
 
 add_library(bf2_engine_objects OBJECT
@@ -631,6 +672,12 @@ if(BF2_BUILD_LINUX)
     # whose platform switch is _LINUX (gsPlatform.h) - the same define bf2_configure_c_target gives
     # the SDK's C objects.
     target_compile_definitions(bf2_engine_objects PRIVATE _LINUX)
+    if(BF2_BUILD_ANDROID)
+        target_compile_definitions(bf2_engine_objects PRIVATE BF2_ANDROID=1)
+        if(NOT CURSES_LIBRARIES)
+            target_compile_definitions(bf2_engine_objects PRIVATE BF2_NO_CURSES=1)
+        endif()
+    endif()
 endif()
 
 # The client is a second compilation of the shared engine sources, not a relink of
@@ -927,7 +974,11 @@ if(BF2_BUILD_LINUX)
     # same directory, where the executable's $ORIGIN rpath finds it.
     set(BF2_DEDICATED_TARGET "bf2")
     set(BF2_DEDICATED_OUTPUT_NAME "bf2")
-    set(BF2_DEDICATED_DEFAULT_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_linux")
+    if(BF2_BUILD_ANDROID)
+        set(BF2_DEDICATED_DEFAULT_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_android")
+    else()
+        set(BF2_DEDICATED_DEFAULT_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin_linux")
+    endif()
     set(BF2_DICE_PY_DEFAULT_DIR "")
     set(BF2_DICE_PY_BUILD_HINT "libdice_py.so is a CMake target (dice_py) on Linux")
 elseif(BF2_BUILD_X64)
@@ -1036,6 +1087,9 @@ if(BF2_BUILD_LINUX)
     # DT_NEEDED list names (libpthread, libdl, libm, libncurses, libdice_py), spelled through CMake.
     target_link_libraries("${BF2_DEDICATED_TARGET}" PRIVATE
         Threads::Threads ${CMAKE_DL_LIBS} m ${CURSES_LIBRARIES})
+    if(BF2_BUILD_ANDROID)
+        target_link_libraries("${BF2_DEDICATED_TARGET}" PRIVATE log)
+    endif()
     # libdice_py.so is resolved beside the executable ($ORIGIN), wherever the pair is copied - the
     # Linux counterpart of staging dice_py.dll beside the exe above.
     set_target_properties("${BF2_DEDICATED_TARGET}" PROPERTIES
@@ -1045,8 +1099,13 @@ if(BF2_BUILD_LINUX)
     )
     # libstdc++/libgcc are linked statically by default so a server built on a newer distribution
     # still runs on an older one; glibc itself stays dynamic (it cannot sensibly be static).
-    option(BF2_LINUX_STATIC_RUNTIME
-        "Link libstdc++ and libgcc statically into bf2 (portability across distributions)" ON)
+    # Android uses libc++ (choose c++_static via -DANDROID_STL=c++_static); the GNU switches are N/A.
+    if(BF2_BUILD_ANDROID)
+        set(BF2_LINUX_STATIC_RUNTIME OFF)
+    else()
+        option(BF2_LINUX_STATIC_RUNTIME
+            "Link libstdc++ and libgcc statically into bf2 (portability across distributions)" ON)
+    endif()
     if(BF2_LINUX_STATIC_RUNTIME)
         target_link_options("${BF2_DEDICATED_TARGET}" PRIVATE -static-libstdc++ -static-libgcc)
     endif()
